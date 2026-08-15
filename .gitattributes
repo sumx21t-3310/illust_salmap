@@ -1,0 +1,3 @@
+# Windows で開発して Linux（RunPod）で実行するので、シェルスクリプトは LF 固定。
+# CRLF のままだとシバンが `/usr/bin/env bash\r` になり "no such file" で落ちる。
+*.sh text eol=lf

@@ -10,6 +10,9 @@
 [Ss]cripts
 pyvenv.cfg
 .venv
+
+# ...but the venv lives in .venv/, and the pattern above swallows our own scripts/.
+!scripts/
 pip-selfcheck.json
 
 ### Python template
