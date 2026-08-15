@@ -4,14 +4,13 @@ import torch
 from pytorch_lightning import LightningModule
 from pytorch_lightning.utilities.types import STEP_OUTPUT
 from torch import Tensor
-from torch.nn import MSELoss, Module
+from torch.nn import Module
 from torch.optim import Adam
-from torchmetrics import AUROC, CosineSimilarity, KLDivergence
-from torchmetrics.image import SpatialCorrelationCoefficient
 from torchvision.transforms.v2.functional import pil_to_tensor
 
-from illust_salmap.training.metrics import convert_auroc, convert_kl_div, convert_scc, convert_sim, normalized
-from illust_salmap.training.utils import generate_plot
+from illust_salmap.training.losses import SaliencyLoss
+from illust_salmap.training.metrics import SaliencyMetrics, normalized
+from illust_salmap.training.visualize import generate_plot
 
 
 def default_optimization_builder(params):
@@ -22,22 +21,18 @@ class SaliencyModel(LightningModule):
     def __init__(
             self,
             model: Module,
-            criterion: Module = MSELoss(),
+            criterion: Module = None,
             optimization_builder: callable = default_optimization_builder, ):
         super().__init__()
         self.model = model
-        self.criterion = criterion
+        # Built here rather than defaulted in the signature: a default argument is
+        # evaluated once at import and then shared by every instance, which silently
+        # shares parameters as soon as a criterion has any.
+        self.criterion = criterion if criterion is not None else SaliencyLoss()
         self.optimization_builder = optimization_builder
 
-        self.val_kl_div = KLDivergence()
-        self.val_sim = CosineSimilarity(reduction="mean")
-        self.val_scc = SpatialCorrelationCoefficient()
-        self.val_auroc = AUROC("binary")
-
-        self.test_kl_div = KLDivergence()
-        self.test_sim = CosineSimilarity(reduction="mean")
-        self.test_scc = SpatialCorrelationCoefficient()
-        self.test_auroc = AUROC("binary")
+        self.val_metrics = SaliencyMetrics("val_")
+        self.test_metrics = SaliencyMetrics("test_")
 
     def forward(self, x) -> Tensor:
         return self.model(x)
@@ -77,21 +72,9 @@ class SaliencyModel(LightningModule):
         predict = outputs["val_predict"]
         image, ground_truth = batch
 
-        kl_div_pred, kl_div_ground = convert_kl_div(predict, ground_truth)
-        sim_pred, sim_ground = convert_sim(predict, ground_truth)
-        scc_pred, scc_ground = convert_scc(predict, ground_truth)
-        auroc_pred, auroc_ground = convert_auroc(predict, ground_truth)
-
-        self.val_kl_div(kl_div_pred, kl_div_ground)
-        self.val_sim(sim_pred, sim_ground)
-        self.val_scc(scc_pred, scc_ground)
-        self.val_auroc(auroc_pred, auroc_ground)
-
         self.log("val_loss", loss, on_step=False, on_epoch=True, enable_graph=False)
-        self.log("val_kl_div", self.val_kl_div, on_step=False, on_epoch=True, enable_graph=False)
-        self.log("val_sim", self.val_sim, on_step=False, on_epoch=True, enable_graph=False)
-        self.log("val_scc", self.val_scc, on_step=False, on_epoch=True, enable_graph=False)
-        self.log("val_auroc", self.val_auroc, on_step=False, on_epoch=True, enable_graph=False)
+        self.log_dict(self.val_metrics.update(predict, ground_truth),
+                      on_step=False, on_epoch=True, enable_graph=False)
 
         if batch_idx == 0:
             self.save_image("validation", self.trainer.current_epoch, image, ground_truth, predict)
@@ -113,21 +96,9 @@ class SaliencyModel(LightningModule):
         predict = outputs["test_predict"]
         image, ground_truth = batch
 
-        kl_div_pred, kl_div_ground = convert_kl_div(predict, ground_truth)
-        sim_pred, sim_ground = convert_sim(predict, ground_truth)
-        scc_pred, scc_ground = convert_scc(predict, ground_truth)
-        auroc_pred, auroc_ground = convert_auroc(predict, ground_truth)
-
-        self.test_kl_div(kl_div_pred, kl_div_ground)
-        self.test_sim(sim_pred, sim_ground)
-        self.test_scc(scc_pred, scc_ground)
-        self.test_auroc(auroc_pred, auroc_ground)
-
         self.log("test_loss", loss, on_step=False, on_epoch=True, prog_bar=True, enable_graph=False)
-        self.log("test_kl_div", self.test_kl_div, on_step=False, on_epoch=True, prog_bar=True, enable_graph=False)
-        self.log("test_sim", self.test_sim, on_step=False, on_epoch=True, prog_bar=True, enable_graph=False)
-        self.log("test_scc", self.test_scc, on_step=False, on_epoch=True, prog_bar=True, enable_graph=False)
-        self.log("test_auroc", self.test_auroc, on_step=False, on_epoch=True, prog_bar=True, enable_graph=False)
+        self.log_dict(self.test_metrics.update(predict, ground_truth),
+                      on_step=False, on_epoch=True, prog_bar=True, enable_graph=False)
 
         if batch_idx == self.trainer.num_test_batches[0] - 1:
             self.save_image("test", self.trainer.current_epoch, image, ground_truth, predict)

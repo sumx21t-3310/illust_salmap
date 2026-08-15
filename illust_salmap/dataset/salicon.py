@@ -3,11 +3,13 @@ from typing import Optional, Callable
 
 from PIL import Image
 from pytorch_lightning import LightningDataModule
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision.transforms.v2 import Normalize, ToTensor, Compose, Resize, Grayscale
 
-from illust_salmap.training.utils import calculate_mean_std
-from illust_salmap.downloader import GoogleDriveDownloader, handle_download
+from illust_salmap.dataset.pairing import paired_paths
+from illust_salmap.dataset.split import stratified_indices
+from illust_salmap.dataset.stats import calculate_mean_std
+from illust_salmap.installer import DatasetInstaller, GoogleDriveDownloader, install_all
 from matplotlib import pyplot
 
 
@@ -27,27 +29,26 @@ class SALICONDataset(Dataset):
         self.image_transform = image_transform
         self.map_transform = map_transform
 
-        self.image_downloader = GoogleDriveDownloader(f"{root}/salicon", self.IMAGE_ID, zip_filename="images.zip")
-        self.map_downloader = GoogleDriveDownloader(f"{root}/salicon", self.MAPS_ID, zip_filename="maps.zip")
-
-        handle_download([
-            self.image_downloader,
-            self.map_downloader
+        self.images_dir, self.maps_dir = install_all([
+            DatasetInstaller(f"{root}/salicon", GoogleDriveDownloader(self.IMAGE_ID, "images.zip")),
+            DatasetInstaller(f"{root}/salicon", GoogleDriveDownloader(self.MAPS_ID, "maps.zip")),
         ])
 
         # 画像とマップのペアを取得
         self.image_map_pair_cache = []
+        self.pair_categories = []
         self.cache_image_map_paths()
 
     def cache_image_map_paths(self):
         for category in self.categories:
-            images_dir = self.image_downloader.extract_path / category
-            maps_dir = self.map_downloader.extract_path / category
+            images_dir = self.images_dir / category
+            maps_dir = self.maps_dir / category
 
-            images_path_list = sorted(images_dir.glob("*.jpg"))
-            maps_path_list = sorted(maps_dir.glob("*.png"))
+            pairs = paired_paths(images_dir.glob("*.jpg"), maps_dir.glob("*.png"), f"salicon/{category}")
 
-            self.image_map_pair_cache.extend(zip(images_path_list, maps_path_list))
+            self.image_map_pair_cache.extend(pairs)
+            # The archive's own folders. Kept so the split preserves their proportions.
+            self.pair_categories.extend([category] * len(pairs))
 
     def __len__(self):
         return len(self.image_map_pair_cache)
@@ -68,12 +69,29 @@ class SALICONDataset(Dataset):
 
 
 class SALICON(LightningDataModule):
-    def __init__(self, root: str = "./data", batch_size: int = 32, num_workers: int = os.cpu_count(), img_size=(256, 384)):
+    """
+    SALICON.
+
+    Note that this does NOT follow SALICON's official 10000/5000/5000 split: the archives
+    downloaded here are a repackaging whose folder layout has not been verified against
+    it. The images are split 80/20, stratified over the archive's own folders, and
+    `test_dataloader` serves the validation split.
+    """
+
+    VAL_RATIO = 0.2
+
+    def __init__(self, root: str = "./data", batch_size: int = 32, num_workers: int = os.cpu_count(),
+                 img_size=(256, 384), val_ratio: float = VAL_RATIO, seed: int = 42):
         super().__init__()
         self.root = root
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.img_size = img_size
+        self.val_ratio = val_ratio
+        self.seed = seed
+
+        self.train = None
+        self.val = None
 
         # データ変換
         self.image_transform = Compose([
@@ -93,29 +111,51 @@ class SALICON(LightningDataModule):
         SALICONDataset(self.root)
 
     def setup(self, stage: str = None):
+        # Lightning calls this once per stage; split only on the first call so `fit` and
+        # `test` see the same partition.
+        if self.train is not None:
+            return
+
         salicon = SALICONDataset(self.root, map_transform=self.map_transform, image_transform=self.image_transform)
-        total = len(salicon)
 
-        n_train = int(total * 0.8)
-        n_val = total - n_train
+        train_indices, val_indices = stratified_indices(
+            salicon.pair_categories, [1 - self.val_ratio, self.val_ratio], self.seed
+        )
 
-        (train, val) = random_split(dataset=salicon, lengths=[n_train, n_val])
-
-        if stage == "fit" or stage is None:
-            self.train = train
-            self.val = val
-
-        if stage == "test" or stage is None:
-            self.test = val
+        self.train = Subset(salicon, train_indices)
+        self.val = Subset(salicon, val_indices)
 
     def train_dataloader(self) -> DataLoader:
-        return DataLoader(self.train, batch_size=self.batch_size, num_workers=self.num_workers)
+        # shuffle is not optional here: `stratified_indices` returns sorted indices, so the
+        # samples arrive grouped by the archive folder they came from. Without it every
+        # batch is drawn from a single category and never changes between epochs.
+        return DataLoader(
+            self.train,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            persistent_workers=self.num_workers > 0,
+            pin_memory=True,
+            shuffle=True,
+        )
 
     def val_dataloader(self) -> DataLoader:
-        return DataLoader(self.val, batch_size=self.batch_size, num_workers=self.num_workers)
+        return DataLoader(
+            self.val,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            persistent_workers=self.num_workers > 0,
+            pin_memory=True,
+        )
 
     def test_dataloader(self) -> DataLoader:
-        return DataLoader(self.test, batch_size=self.batch_size, num_workers=self.num_workers)
+        """Serves the validation split: no held-out test set is carved out here."""
+        return DataLoader(
+            self.val,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            persistent_workers=self.num_workers > 0,
+            pin_memory=True,
+        )
 
 
 if __name__ == '__main__':

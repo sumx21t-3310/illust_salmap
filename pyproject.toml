@@ -1,0 +1,78 @@
+[project]
+name = "illust_salmap"
+version = "1.0.0"
+description = "A machine learning project for generating saliency maps of illustrations."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Sumx21t", email = "otoro180yen@gmail.com" }]
+requires-python = ">=3.10,<3.13"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "torch==2.5.1",
+    "torchvision==0.20.1",
+    "torchinfo==1.8.0",
+    "torchmetrics==1.6.0",
+    "pytorch-lightning==2.4.0",
+    "tensorboard~=2.18.0",
+    "matplotlib==3.9.4",
+    "pillow==11.0.0",
+    "numpy==1.26.4",
+    "tqdm==4.67.1",
+    "requests==2.32.3",
+    "gdown==5.2.0",
+    "psutil~=6.1.0",
+    "setuptools==75.6.0",
+]
+
+[project.scripts]
+illust-salmap = "illust_salmap.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/NebusokuDev/illust_salmap.git"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["illust_salmap*"]
+
+# Resolve for the dev machine (Windows) and the training machine (RunPod / Linux) only.
+[tool.uv]
+environments = [
+    "sys_platform == 'win32'",
+    "sys_platform == 'linux'",
+]
+
+# torch/torchvision are pulled from PyTorch's own indexes so that Windows gets CPU
+# wheels and Linux gets the CUDA 12.4 build. `explicit = true` keeps every other
+# package on PyPI.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'win32'" },
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'win32'" },
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux'" },
+]

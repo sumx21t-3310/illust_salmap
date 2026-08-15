@@ -3,12 +3,14 @@ import os
 from PIL import Image
 from matplotlib import pyplot
 from pytorch_lightning import LightningDataModule
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
 from torchvision.transforms.v2 import Compose, Grayscale, Normalize, Resize, ToTensor, Transform
 
-from illust_salmap.downloader.downloader import Downloader
-from illust_salmap.training.utils import calculate_mean_std
+from illust_salmap.dataset.pairing import paired_paths
+from illust_salmap.dataset.split import stratified_indices
+from illust_salmap.installer import DatasetInstaller, HttpDownloader
+from illust_salmap.dataset.stats import calculate_mean_std
 
 
 class Imp1kCategories:
@@ -36,23 +38,23 @@ class Imp1kDataset(Dataset):
 
         print(f"url: {self.URL}")
 
-        self.downloader = Downloader(root=f"{root}/imp1k", url=self.URL)
-
-        self.downloader()
+        self.data_dir = DatasetInstaller(root=f"{root}/imp1k", downloader=HttpDownloader(self.URL)).install()
 
         # 画像とマップのペアを取得
         self.image_map_pair_cache = []
+        self.pair_categories = []
         self.cache_image_map_paths()
 
     def cache_image_map_paths(self):
 
         for category in self.categories:
-            images_dir = self.downloader.extract_path / "imgs" / category
-            maps_dir = self.downloader.extract_path / "maps" / category
-            images_path_list = sorted(images_dir.glob("*"))
-            maps_path_list = sorted(maps_dir.glob("*"))
+            images_dir = self.data_dir / "imgs" / category
+            maps_dir = self.data_dir / "maps" / category
+            pairs = paired_paths(images_dir.glob("*"), maps_dir.glob("*"), f"imp1k/{category}")
 
-            self.image_map_pair_cache.extend((zip(images_path_list, maps_path_list)))
+            self.image_map_pair_cache.extend(pairs)
+            # Kept alongside the pairs so the split can stay category-balanced.
+            self.pair_categories.extend([category] * len(pairs))
 
     def __len__(self):
         return len(self.image_map_pair_cache)
@@ -73,12 +75,27 @@ class Imp1kDataset(Dataset):
 
 
 class Imp1k(LightningDataModule):
+    """
+    Imp1k.
+
+    The dataset ships no canonical split, so the images are divided 80/20 here,
+    stratified over the four design categories. `test_dataloader` serves the validation
+    split -- there is no separate held-out set.
+    """
+
+    VAL_RATIO = 0.2
+
     def __init__(self, root: str = "./data", batch_size: int = 64, num_workers: int = os.cpu_count(),
-                 img_size=(256, 256)):
+                 img_size=(256, 256), val_ratio: float = VAL_RATIO, seed: int = 42):
         super().__init__()
         self.root = root
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.val_ratio = val_ratio
+        self.seed = seed
+
+        self.train = None
+        self.val = None
 
         # データ変換
         self.image_transform = Compose([
@@ -98,29 +115,51 @@ class Imp1k(LightningDataModule):
         Imp1kDataset(self.root)
 
     def setup(self, stage: str = None):
+        # Lightning calls this once per stage; split only on the first call so `fit` and
+        # `test` see the same partition.
+        if self.train is not None:
+            return
+
         imp1k = Imp1kDataset(self.root, map_transform=self.map_transform, image_transform=self.image_transform)
-        total = len(imp1k)
 
-        n_train = int(total * 0.8)
-        n_val = total - n_train
+        train_indices, val_indices = stratified_indices(
+            imp1k.pair_categories, [1 - self.val_ratio, self.val_ratio], self.seed
+        )
 
-        (train, val) = random_split(dataset=imp1k, lengths=[n_train, n_val])
-
-        if stage == "fit" or stage is None:
-            self.train = train
-            self.val = val
-
-        if stage == "test" or stage is None:
-            self.test = val
+        self.train = Subset(imp1k, train_indices)
+        self.val = Subset(imp1k, val_indices)
 
     def train_dataloader(self) -> DataLoader:
-        return DataLoader(self.train, batch_size=self.batch_size, num_workers=self.num_workers)
+        # shuffle is not optional here: `stratified_indices` returns sorted indices, so the
+        # samples arrive grouped by design category. Without it every batch is drawn from a
+        # single category and never changes between epochs.
+        return DataLoader(
+            self.train,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            persistent_workers=self.num_workers > 0,
+            pin_memory=True,
+            shuffle=True,
+        )
 
     def val_dataloader(self) -> DataLoader:
-        return DataLoader(self.val, batch_size=self.batch_size, num_workers=self.num_workers)
+        return DataLoader(
+            self.val,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            persistent_workers=self.num_workers > 0,
+            pin_memory=True,
+        )
 
     def test_dataloader(self) -> DataLoader:
-        return DataLoader(self.test, batch_size=self.batch_size, num_workers=self.num_workers)
+        """Serves the validation split: Imp1k defines no held-out test set."""
+        return DataLoader(
+            self.val,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            persistent_workers=self.num_workers > 0,
+            pin_memory=True,
+        )
 
 
 class PadToSquare(Transform):

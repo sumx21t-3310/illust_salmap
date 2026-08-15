@@ -4,11 +4,13 @@ from typing import Optional, Callable
 from PIL import Image
 from matplotlib import pyplot
 from pytorch_lightning import LightningDataModule
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision.transforms.v2 import Resize, Compose, ToTensor, Normalize, Grayscale
 
-from illust_salmap.downloader.downloader import Downloader
-from illust_salmap.training.utils import calculate_mean_std
+from illust_salmap.dataset.pairing import paired_paths
+from illust_salmap.dataset.split import stratified_indices
+from illust_salmap.installer import DatasetInstaller, HttpDownloader
+from illust_salmap.dataset.stats import calculate_mean_std
 
 
 class Cat2000Dataset(Dataset):
@@ -22,14 +24,15 @@ class Cat2000Dataset(Dataset):
         self.categories = categories or ["*"]  # None の場合デフォルトで全カテゴリ
         self.image_transform = image_transform
         self.map_transform = map_transform
-        self.downloader = Downloader(root=f"{root}/cat2000", url=self.URL)
+        self.data_dir = DatasetInstaller(root=f"{root}/cat2000", downloader=HttpDownloader(self.URL)).install()
 
         self.image_map_pair_cache = []
-        self.downloader(on_complete=self.cache_image_map_paths)
+        self.pair_categories = []
+        self.cache_image_map_paths()
 
     def cache_image_map_paths(self):
-        stimuli_path = self.downloader.extract_path / "Stimuli"
-        fixation_path = self.downloader.extract_path / "FIXATIONMAPS"
+        stimuli_path = self.data_dir / "Stimuli"
+        fixation_path = self.data_dir / "FIXATIONMAPS"
 
         # カテゴリの展開（"*" を含む場合は全カテゴリ）
         if "*" in self.categories:
@@ -40,10 +43,15 @@ class Cat2000Dataset(Dataset):
         expanded_categories.sort()
 
         for category in expanded_categories:
-            stimuli_path_list = sorted((stimuli_path / category).glob("???.jpg"))
-            fixation_path_list = sorted((fixation_path / category).glob("???.jpg"))
+            pairs = paired_paths(
+                (stimuli_path / category).glob("???.jpg"),
+                (fixation_path / category).glob("???.jpg"),
+                f"cat2000/{category}",
+            )
 
-            self.image_map_pair_cache.extend(zip(stimuli_path_list, fixation_path_list))
+            self.image_map_pair_cache.extend(pairs)
+            # Kept alongside the pairs so the split can stay category-balanced.
+            self.pair_categories.extend([category] * len(pairs))
 
     def __len__(self):
         return len(self.image_map_pair_cache)
@@ -64,12 +72,33 @@ class Cat2000Dataset(Dataset):
 
 
 class Cat2000(LightningDataModule):
+    """
+    CAT2000, as far as the public data allows.
+
+    The paper divides 4000 images into 2000 train and 2000 test, 100 per category on
+    each side, and holds back every fixation of the test half -- those are only scored
+    by the MIT/Tuebingen benchmark server. `trainSet.zip` is therefore the whole of what
+    can be used locally, and this module splits it the way the literature does: 1800 for
+    training and 200 for validation, stratified over the 20 categories.
+
+    Since the real test set is unavailable, `test_dataloader` serves the validation
+    split. Numbers it produces describe held-out validation data, not the benchmark.
+    """
+
+    VAL_RATIO = 0.1
+
     def __init__(self, root: str = "./data", batch_size: int = 32, num_workers: int = os.cpu_count(),
-                 img_size=(256, 384), image_transform=None, map_transform=None):
+                 img_size=(216, 384), image_transform=None, map_transform=None,
+                 val_ratio: float = VAL_RATIO, seed: int = 42):
         super().__init__()
         self.root = root
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.val_ratio = val_ratio
+        self.seed = seed
+
+        self.train = None
+        self.val = None
 
         self.image_transform = image_transform or Compose([
             Resize(img_size),
@@ -83,26 +112,24 @@ class Cat2000(LightningDataModule):
             ToTensor(),
             Normalize([0.5], [0.5])
         ])
-
+# 
     def prepare_data(self):
         Cat2000Dataset(self.root)
 
     def setup(self, stage: str = None):
+        # Lightning calls this once per stage. Splitting only on the first call keeps
+        # `fit` and `test` looking at the same partition instead of redrawing it.
+        if self.train is not None:
+            return
+
         cat2000 = Cat2000Dataset(self.root, map_transform=self.map_transform, image_transform=self.image_transform)
-        total = len(cat2000)
 
-        n_train = int(total * 0.7)
-        n_val = int(total * 0.2)
-        n_test = total - n_train - n_val
+        train_indices, val_indices = stratified_indices(
+            cat2000.pair_categories, [1 - self.val_ratio, self.val_ratio], self.seed
+        )
 
-        train, val, test = random_split(dataset=cat2000, lengths=[n_train, n_val, n_test])
-
-        if stage == "fit" or stage is None:
-            self.train = train
-            self.val = val
-
-        if stage == "test" or stage is None:
-            self.test = test
+        self.train = Subset(cat2000, train_indices)
+        self.val = Subset(cat2000, val_indices)
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(
@@ -124,8 +151,9 @@ class Cat2000(LightningDataModule):
         )
 
     def test_dataloader(self) -> DataLoader:
+        """Serves the validation split: CAT2000's real test fixations are not public."""
         return DataLoader(
-            self.test,
+            self.val,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             persistent_workers=self.num_workers > 0,

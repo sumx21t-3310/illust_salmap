@@ -1,16 +1,19 @@
-import torch
 from torch.nn import *
-from torch.nn.functional import interpolate
 from torchinfo import summary
 
+from illust_salmap.models.blocks import AddSkip, NoSkip
 from illust_salmap.models.ez_bench import benchmark
-from illust_salmap.training.saliency_model import SaliencyModel
+from illust_salmap.models.checkpoint import load_weights
 
 
 class UNetLite(Module):
     def __init__(self, in_channels=3, out_channels=1, use_skip_connection=True):
         super(UNetLite, self).__init__()
-        self.use_skip_connection = use_skip_connection
+
+        # resize=True because the two deepest levels skip across a resolution change:
+        # the bottleneck halves 8px to 4px, so enc_512 has to come down to meet it.
+        # Stateless, so one instance serves every level.
+        self.skip = AddSkip(resize=True) if use_skip_connection else NoSkip()
 
         self.encoder_in_32 = Encoder(in_channels, 32)
         self.encoder_32_64 = Encoder(32, 64)
@@ -20,14 +23,18 @@ class UNetLite(Module):
 
         self.bottleneck = Bottleneck()
 
-        self.decoder_512_512 = Decoder(512, 512, use_skip_connection)
-        self.decoder_512_256 = Decoder(512, 256, use_skip_connection)
-        self.decoder_256_128 = Decoder(256, 128, use_skip_connection)
-        self.decoder_128_64 = Decoder(128, 64, use_skip_connection)
-        self.decoder_64_32 = Decoder(64, 32, use_skip_connection)
-        self.decoder_32_out = Decoder(32, out_channels, use_skip_connection)
+        self.decoder_512_512 = Decoder(512, 512)
+        self.decoder_512_256 = Decoder(512, 256)
+        self.decoder_256_128 = Decoder(256, 128)
+        self.decoder_128_64 = Decoder(128, 64)
+        self.decoder_64_32 = Decoder(64, 32)
+        self.decoder_32_out = Decoder(32, 32)
 
-        self.output = Tanh()
+        # Projected outside the last Decoder, which normalizes. BatchNorm2d on a
+        # 1-channel output rescales every prediction by its own batch's statistics, so the
+        # same image would score differently depending on what it was batched with.
+        self.output = Conv2d(32, out_channels, 1)
+        self.head = Tanh()
 
     def forward(self, x):
         # var name is "{layer}_{output_ch}"
@@ -39,14 +46,14 @@ class UNetLite(Module):
 
         bottle_512 = self.bottleneck(enc_512)
 
-        dec_512 = self.decoder_512_512.skip_connection(bottle_512, enc_512)
-        dec_256 = self.decoder_512_256.skip_connection(dec_512, bottle_512)
-        dec_128 = self.decoder_256_128.skip_connection(dec_256, enc_256)
-        dec_64 = self.decoder_128_64.skip_connection(dec_128, enc_128)
-        dec_32 = self.decoder_64_32.skip_connection(dec_64, enc_64)
-        dec_out = self.decoder_32_out.skip_connection(dec_32, enc_32)
+        dec_512 = self.decoder_512_512(self.skip(bottle_512, enc_512))
+        dec_256 = self.decoder_512_256(self.skip(dec_512, bottle_512))
+        dec_128 = self.decoder_256_128(self.skip(dec_256, enc_256))
+        dec_64 = self.decoder_128_64(self.skip(dec_128, enc_128))
+        dec_32 = self.decoder_64_32(self.skip(dec_64, enc_64))
+        dec_out = self.decoder_32_out(self.skip(dec_32, enc_32))
 
-        return self.output(dec_out)
+        return self.head(self.output(dec_out))
 
 
 class Encoder(Module):
@@ -64,27 +71,27 @@ class Encoder(Module):
 
 
 class Decoder(Module):
-    def __init__(self, in_channels=64, out_channels=3, use_skip_connection=True, dropout_prob=0):
-        super(Decoder, self).__init__()
+    """Single conv after the upsample -- lighter than the shared `blocks.DecoderBlock`,
+    which is why UNetLite keeps its own.
 
-        self.use_skip_connection = use_skip_connection
+    Ends on an activation. It used to end on `Conv2d -> BatchNorm2d`, and since `AddSkip`
+    carries no activation either, the stretch from that conv through the skip and into the
+    next block's ConvTranspose2d was affine: the whole decoder held one LeakyReLU per
+    block and half its linear layers folded together. The trailing `Dropout2d(p=0)` that
+    sat here was a dead layer and is gone.
+    """
+
+    def __init__(self, in_channels=64, out_channels=3):
+        super(Decoder, self).__init__()
 
         self.decoder = Sequential(ConvTranspose2d(in_channels, in_channels, kernel_size=4, stride=2, padding=1),
                                   LeakyReLU(0.2),
                                   Conv2d(in_channels, out_channels, 3, 1, 1),
                                   BatchNorm2d(out_channels),
-                                  Dropout2d(dropout_prob), )
+                                  LeakyReLU(0.2), )
 
     def forward(self, x):
         return self.decoder(x)
-
-    def skip_connection(self, x, y):
-        if not self.use_skip_connection:
-            return self.forward(x)
-
-        y = interpolate(y, size=x.shape[2:], mode='bilinear', align_corners=True)
-
-        return self.forward(x + y)
 
 
 class Bottleneck(Module):
@@ -101,15 +108,12 @@ class Bottleneck(Module):
 
 
 def unet_lite(ckpt_path=None) -> UNetLite:
-    if ckpt_path:
-        model = SaliencyModel(UNetLite())
-        state_dict = torch.load(ckpt_path, map_location=torch.device('cpu'), weights_only=True)['state_dict']
-        model.load_state_dict(state_dict)
-        print("Successfully loaded the model")
+    model = UNetLite()
 
-        if isinstance(model.model, UNetLite):
-            return model.model
-    return UNetLite()
+    if ckpt_path:
+        load_weights(model, ckpt_path)
+
+    return model
 
 
 if __name__ == '__main__':
